@@ -41,10 +41,21 @@
 
 // ----- Defines -----
 
-#if ( DebounceThrottleDiv_define > 0 )
-nat_ptr_t Matrix_divCounter = 0;
-#endif
+// A neverending scan counter.
+uint32_t Matrix_divCounter = 0;
 
+// A minimum threshold in the value between two key presses and releases
+// required in order to output the value. Warning: This was set empirically
+// after inspecting the histogram of time differences and will be incorrect for
+// non-zero values of DebounceThrottleDiv.
+//
+// FIXME: Estimate this automatically to avoid the need for hardcoding.
+uint32_t Matrix_repeatThreshold = 16;
+
+// Histograms to tally the times taken between key presses and releases. This is
+// fed to the "matrixHist" routine for debugging.
+uint32_t Matrix_timesRelease[32];
+uint32_t Matrix_timesPress[32];
 
 
 // ----- Function Declarations -----
@@ -52,6 +63,7 @@ nat_ptr_t Matrix_divCounter = 0;
 // CLI Functions
 void cliFunc_matrixDebug( char* args );
 void cliFunc_matrixState( char* args );
+void cliFunc_matrixHist( char* args );
 
 
 
@@ -60,10 +72,12 @@ void cliFunc_matrixState( char* args );
 // Scan Module command dictionary
 CLIDict_Entry( matrixDebug,  "Enables matrix debug mode, prints out each scan code." NL "\t\tIf argument \033[35mT\033[0m is given, prints out each scan code state transition." );
 CLIDict_Entry( matrixState,  "Prints out the current scan table N times." NL "\t\t \033[1mO\033[0m - Off, \033[1;33mP\033[0m - Press, \033[1;32mH\033[0m - Hold, \033[1;35mR\033[0m - Release, \033[1;31mI\033[0m - Invalid" );
+CLIDict_Entry( matrixHist,   "Prints a histogram of the times between a key presss and releases." );
 
 CLIDict_Def( matrixCLIDict, "Matrix Module Commands" ) = {
 	CLIDict_Item( matrixDebug ),
 	CLIDict_Item( matrixState ),
+	CLIDict_Item( matrixHist ),
 	{ 0, 0, 0 } // Null entry for dictionary end
 };
 
@@ -197,15 +211,22 @@ void Matrix_setup()
 	// Clear out Debounce Array
 	for ( uint8_t item = 0; item < Matrix_maxKeys; item++ )
 	{
-		Matrix_scanArray[ item ].prevState     = KeyState_Off;
-		Matrix_scanArray[ item ].curState      = KeyState_Off;
-		Matrix_scanArray[ item ].activeCount   = 0;
+		Matrix_scanArray[ item ].prevState = KeyState_Off;
+		Matrix_scanArray[ item ].curState = KeyState_Off;
+		Matrix_scanArray[ item ].activeCount = 0;
 		Matrix_scanArray[ item ].inactiveCount = DebounceDivThreshold_define; // Start at 'off' steady state
+		Matrix_scanArray[ item ].lastChangeCounter = 0;
 	}
 
 	// Clear scan stats counters
 	matrixMaxScans  = 0;
 	matrixPrevScans = 0;
+
+	// Clear histogram counters.
+	for (int i = 0; i < 32; ++i) {
+		Matrix_timesRelease[i] = 0;
+		Matrix_timesPress[i] = 0;
+	}
 }
 
 void Matrix_keyPositionDebug( KeyPosition pos )
@@ -237,21 +258,25 @@ void Matrix_keyPositionDebug( KeyPosition pos )
 }
 
 
-// Scan the matrix for keypresses
+ // Scan the matrix for keypresses
 // NOTE: scanNum should be reset to 0 after a USB send (to reset all the counters)
 void Matrix_scan( uint16_t scanNum )
 {
+	++Matrix_divCounter;
+    
 #if ( DebounceThrottleDiv_define > 0 )
 	// Scan-rate throttling
 	// By scanning using a divider, the scan rate slowed down
 	// DebounceThrottleDiv_define == 1 means -> /2 or half scan rate
 	// This helps with bouncy switches on fast uCs
-	if ( !( Matrix_divCounter++ & (1 << ( DebounceThrottleDiv_define - 1 )) ) )
+	if ( !( Matrix_divCounter & (1 << ( DebounceThrottleDiv_define - 1 )) ) )
 		return;
 #endif
 
-	// Increment stats counters
-	if ( scanNum > matrixMaxScans ) matrixMaxScans = scanNum;
+ 	// Increment stats counters
+	if ( scanNum > matrixMaxScans ) {
+		matrixMaxScans = scanNum;
+	}
 	if ( scanNum == 0 )
 	{
 		matrixPrevScans = matrixCurScans;
@@ -293,14 +318,18 @@ void Matrix_scan( uint16_t scanNum )
 			if ( Matrix_pin( Matrix_rows[ sense ], Type_Sense ) )
 			{
 				// Only update if not going to wrap around
-				if ( state->activeCount < DebounceDivThreshold_define ) state->activeCount += 1;
+				if ( state->activeCount < DebounceDivThreshold_define ) {
+					state->activeCount += 1;
+				}
 				state->inactiveCount >>= 1;
 			}
 			// Signal Not Detected
 			else
 			{
 				// Only update if not going to wrap around
-				if ( state->inactiveCount < DebounceDivThreshold_define ) state->inactiveCount += 1;
+				if ( state->inactiveCount < DebounceDivThreshold_define ) {
+					state->inactiveCount += 1;
+				}
 				state->activeCount >>= 1;
 			}
 
@@ -310,6 +339,23 @@ void Matrix_scan( uint16_t scanNum )
 			//   and either active or inactive count is over the debounce threshold
 			if ( state->curState == KeyState_Invalid )
 			{
+				// Compute the time difference since the last
+				// change.
+				uint32_t diff = Matrix_divCounter - state->lastChangeCounter;
+
+				// Compute the corresponding histogram bucket
+				// (as a power of two).
+				uint8_t bucket = 31 - __builtin_clzl(diff);
+				
+				// Ignore this event if it occurs too fast in a
+				// sequence. This is necessary because the
+				// debouncing logic appears to be trumped by
+				// some sequence of events. FIXME: Review this.
+				if ( diff < Matrix_repeatThreshold ) {
+					state->curState = state->prevState;
+					continue;
+				}
+
 				switch ( state->prevState )
 				{
 				case KeyState_Press:
@@ -321,6 +367,8 @@ void Matrix_scan( uint16_t scanNum )
 					else
 					{
 						state->curState = KeyState_Release;
+						Matrix_timesRelease[bucket]++;
+						state->lastChangeCounter = Matrix_divCounter;
 					}
 					break;
 
@@ -329,6 +377,8 @@ void Matrix_scan( uint16_t scanNum )
 					if ( state->activeCount > state->inactiveCount )
 					{
 						state->curState = KeyState_Press;
+						Matrix_timesPress[bucket]++;
+						state->lastChangeCounter = Matrix_divCounter;
 					}
 					else
 					{
@@ -465,6 +515,19 @@ void cliFunc_matrixState ( char* args )
 	if ( arg1Ptr[0] != '\0' )
 	{
 		matrixDebugStateCounter = (uint16_t)numToInt( arg1Ptr );
+	}
+}
+
+void cliFunc_matrixHist ( char* args )
+{
+	print("Histogram\r\n");
+	for (int8_t i = 0; i < 32; ++i) {
+		printInt8(i);
+		print(" ");
+		printInt32(Matrix_timesRelease[i]);
+		print(" ");
+		printInt32(Matrix_timesPress[i]);
+		print(NL);
 	}
 }
 

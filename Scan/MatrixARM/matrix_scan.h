@@ -131,6 +131,7 @@ typedef struct KeyState {
 	KeyPosition     curState;
 	DebounceCounter activeCount;
 	DebounceCounter inactiveCount;
+	uint32_t 	lastChangeCounter;
 } KeyState;
 
 
