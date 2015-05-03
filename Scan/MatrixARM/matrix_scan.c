@@ -50,7 +50,7 @@ uint32_t Matrix_divCounter = 0;
 // non-zero values of DebounceThrottleDiv.
 //
 // FIXME: Estimate this automatically to avoid the need for hardcoding.
-uint32_t Matrix_repeatThreshold = 16;
+uint32_t Matrix_repeatThreshold = 22;
 
 // Histograms to tally the times taken between key presses and releases. This is
 // fed to the "matrixHist" routine for debugging.
